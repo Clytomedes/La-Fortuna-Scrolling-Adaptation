@@ -19,7 +19,7 @@
 
 lcd display;
 static char lines[MAX_SCROLLING_LINES][53]; /* 30 lines with 53 characters per line */
-uint8_t current, beginning, position, keep, scrolling, amountScrolledUp;
+uint8_t current, beginning, position, keep, scrolling, amountScrolledUp, clearing, canScrollUp, shiftedLines;
 
 void init_lcd()
 {
@@ -58,8 +58,8 @@ void init_lcd()
     /* EICRB |= _BV(ISC61); */
     PORTB |= _BV(BLC);
 
-    current = beginning = position = amountScrolledUp = 0;
-    scrolling = keep = 1;
+    current = beginning = position = amountScrolledUp = canScrollUp = shiftedLines = 0;
+    scrolling = keep = clearing = 1;
 }
 
 void lcd_brightness(uint8_t i)
@@ -191,6 +191,24 @@ void fill_rectangle_indexed(rectangle r, uint16_t* col)
             write_data16(*col++);
 }
 
+void set_foreground(uint16_t col)
+{
+    /* Set the colour of the foreground to be displayed when printing to the screen */
+    display.foreground = col;
+}
+
+void set_background(uint16_t col)
+{
+    /* Set the colour of the background to be displayed when printing to the screen */
+    display.background = col;
+}
+
+void set_clearing(uint8_t val)
+{
+    /* Turn on or off the screen clearing or scrolling when the cursor hits the bottom of the screen */
+    clearing = val;
+}
+
 void clear_screen()
 {
     display.x = 0;
@@ -232,15 +250,18 @@ void scroll_up_no_lines(uint8_t noLines) {
 
 void scroll_up()
 {
-    /* Scroll up a single line, only possible if scrolled down */
-    scroll(beginning - 1, display.height / 8); /* Start the scrolling from the previous line to go up */
+    if (canScrollUp > 0) {
+        /* Scroll up a single line, only possible if scrolled down */
+        scroll(beginning - 1, display.height / 8); /* Start the scrolling from the previous line to go up */
 
-    amountScrolledUp++;
-    /* Decrement the start of the circular array */
-    if (beginning == 0) {
-        beginning = MAX_SCROLLING_LINES;
-    } else {
-        beginning--;
+        amountScrolledUp++;
+        /* Decrement the start of the circular array */
+        if (beginning == 0) {
+            beginning = MAX_SCROLLING_LINES;
+        } else {
+            beginning--;
+        }
+        canScrollUp--;
     }
 }
 
@@ -258,6 +279,54 @@ void scroll_down()
     if (beginning == MAX_SCROLLING_LINES) {
         beginning = 0;
     }
+
+    if (canScrollUp < (MAX_SCROLLING_LINES - (display.height /8))) {
+        canScrollUp++;
+    }
+}
+
+uint8_t can_scroll_up()
+{
+    /* Has the screen scrolled so there are lines to scroll up to */
+    if (canScrollUp > 0) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+uint8_t amount_scroll_up()
+{
+    /* The total number of lines that can be scrolled up */
+    return canScrollUp;
+}
+
+uint8_t lines_from_bottom()
+{
+    /* Lines until the bottom of the screen is reached */
+    if (canScrollUp > 0 || beginning > 0 || current > (display.height / 8)) {
+        return 0;
+    } else {
+        return (display.height / 8) - current;
+    }
+}
+
+void shift_up_lines(uint8_t noLines)
+{
+    /* Shift the lines on the screen up by the specified lines */
+    scroll(beginning + noLines, (display.height / 8) - noLines);
+    shiftedLines += noLines;
+}
+
+void shift_back_down(void)
+{
+    /* Return back to before the screen was shifted */
+    if (lines_from_bottom() == 0) {
+        scroll(beginning, (display.height / 8) - 1);
+    } else {
+        scroll(beginning, (display.height / 8) - lines_from_bottom());
+    }
+    shiftedLines = 0;
 }
 
 void scroll(uint8_t startLocation, uint8_t linesToPrint)
@@ -301,6 +370,12 @@ void display_char(char c)
     if (amountScrolledUp > 0 && keep) {
         jump_to_bottom();
     }
+
+    /* If currently shifted, shift down before printing */
+    if (shiftedLines > 0 && keep) {
+        shift_back_down();
+    }
+
     uint16_t x, y;
     PGM_P fdata;
     uint8_t bits, mask;
@@ -319,7 +394,10 @@ void display_char(char c)
             current = 0;
         }
         if (display.y >= display.height) {
-            if (scrolling) {
+            if (!clearing) {
+                /* Allow the cursor to reach the end of the screen and do nothing */
+                return;
+            } else if (scrolling) {
                 scroll_down();
             } else {
                 clear_screen();
@@ -370,7 +448,10 @@ void display_char(char c)
         }
     }
     if (display.y >= display.height) {
-        if (scrolling) {
+        if (!clearing) {
+            /* Allow the cursor to reach the end of the screen and do nothing */
+            return;
+        } else if (scrolling) {
             scroll_down();
         } else {
             clear_screen();
@@ -385,12 +466,72 @@ void display_string(char *str)
         display_char(str[i]);
 }
 
+uint16_t get_x(void)
+{
+    return display.x;
+}
+
+uint16_t get_y(void)
+{
+    return display.y;
+}
+
+void set_xy(uint16_t x, uint16_t y)
+{
+    display.x = x;
+    display.y = y;
+}
+
+lcdState get_lcd_state()
+{
+    /* Get the current state */
+    lcdState state = { display, current, beginning, position, keep, scrolling, amountScrolledUp, clearing, canScrollUp, shiftedLines };
+    return state;
+}
+
+void set_lcd_state(lcdState state)
+{
+    /* Load a state */
+    display = state.displayState;
+    current = state.currentState;
+    beginning = state.beginningState;
+    position = state.positionState;
+    keep = state.keepState;
+    scrolling = state.scrollingState;
+    amountScrolledUp = state.amountScrolledUpState;
+    clearing = state.clearingState;
+    canScrollUp = state.canScrollUpState;
+    shiftedLines = state.shiftedLinesState;
+}
+
+void display_char_xy(char c, uint16_t x, uint16_t y)
+{
+    /* Cannot be implemented with scrolling due to ability of possibly not being on the same lines
+       Recommened to turn off scrolling if using this and possibly setting the line clearing off */
+    uint16_t oldX = display.x;
+    uint16_t oldY = display.y;
+    keep = 0;
+    display.x = x;
+    display.y = y;
+    display_char(c);
+    keep = 1;
+    display.x = oldX;
+    display.y = oldY;
+}
+
 void display_string_xy(char *str, uint16_t x, uint16_t y)
 {
-    /* Cannot be implemented with scrolling due to ability of possibly not being on the same lines */
+    /* Cannot be implemented with scrolling due to ability of possibly not being on the same lines
+       Recommened to turn off scrolling if using this and possibly setting the line clearing off */
+    uint16_t oldX = display.x;
+    uint16_t oldY = display.y;
+    keep = 0;
     uint8_t i;
     display.x = x;
     display.y = y;
     for(i=0; str[i]; i++)
         display_char(str[i]);
+    keep = 1;
+    display.x = oldX;
+    display.y = oldY;
 }
